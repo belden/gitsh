@@ -1,0 +1,188 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+
+my %args;
+GetOptions(
+  'command=s'     => \$args{command},
+  'debug'         => \$args{debug},
+  'with-status=i' => \$args{'with-status'},
+);
+
+my $gitsh = Gitsh->new(%args);
+$gitsh->go;
+
+{
+  use strict;
+  use warnings;
+  package Gitsh;
+
+  sub safe_eq { no warnings; return shift eq pop }
+
+  sub new {
+    my ($class, %args) = @_;
+    return bless {
+      args    => \%args,
+      '$?'    => $args{'with-status'} || 0,
+      command => $args{command},
+      debug   => $args{debug} || 0,
+      history => [],
+    }, $class;
+  }
+
+  sub go {
+    my $self = shift;
+
+    $self->restart_under_debugger if $self->{debug};
+
+    my $keep_running = 1;
+    $|++;
+    while ($keep_running) {
+
+      # print a prompt and get some input - weird handling of $command so ^D works
+      print STDOUT 'dev@t1-dev:adama¿¡ ';
+      my $command = $self->_get_command;
+
+      ($keep_running, $self->{'$?'}) = $self->dispatch($command);
+    }
+
+    $self->finalize;
+    CORE::exit($self->{'$?'});
+  }
+
+  sub _get_command {
+    my ($self) = @_;
+    my $command = $self->{command} || <>;
+    if (!defined $command) {
+      print STDOUT "\n";
+      $command = 'exit';
+    }
+    chomp $command;
+
+    $self->add_history($command) unless $command eq 'exit';
+    return $command;
+  }
+
+  sub add_history {
+    my ($self, $command_line) = @_;
+    push @{$self->{history}}, $command_line;
+  }
+
+  sub dispatch {
+    my ($self, $command) = @_;
+    my $handler = $self->dispatch_map($command);
+    return $handler->();
+  }
+
+  sub dispatch_map {
+    my ($self, $command) = @_;
+    my $parse = $self->parse($command);
+    my $handler = $self->can($parse->{command}) || sub {
+      my ($self, $args) = @_;
+      print STDERR "$parse->{command}: command not found\n";
+      return (1, 1);
+    };
+
+    if ($parse->{command} =~ m{^_}) {
+      return sub {
+        my @g = $self->$handler($parse);
+        use Data::Dumper; print Dumper \@g;
+        return (1, 0);
+      };
+    } else {
+      return sub { $self->$handler($parse) };
+    }
+  }
+
+  sub parse {
+    my ($self, $command) = @_;
+    my ($action, @args) = split /\s+/, $command;
+    return +{
+      command => $action,
+      args => \@args,
+      orig => $command,
+    };
+  }
+
+  sub echo {
+    my ($self, $command) = @_;
+
+    if ($command->{args}[0] eq '$?' && 1 == @{$command->{args}}) { # echo $?
+      print STDOUT $self->{'$?'}, "\n";
+    } else { # just echo
+      (my $to_echo = $command->{orig}) =~ s{^$command->{command} }{};
+      print STDOUT $to_echo, "\n";
+    }
+
+    return (1, 0);
+  }
+
+  sub exit {
+    return (0, 0);
+  }
+
+  sub restart {
+    my ($self, $command) = @_;
+    if (safe_eq($command->{args}[0], '--debug')) {
+      $self->restart_under_debugger;
+    } else {
+      exec("$0 --with-status $self->{'$?'}");
+    }
+    die "restart: $!\n";
+  }
+
+  sub _ls {
+    my ($self) = @_;
+    return map {
+      chomp;
+      my ($active, $name) = $_ =~ m{^(?:([* ]) )(.+)$};
+      +{
+        name => $name,
+        active => $active eq '*' ? 1 : 0,
+      },
+    } `git branch`;
+  }
+
+  sub pwd {
+    my ($self, $command) = @_;
+    my ($branch) = grep { $_->{active} } $self->_ls;
+    print(STDOUT "$branch->{name}\n");
+    return (1, 0);
+  }
+
+  sub restart_under_debugger {
+    my ($self) = @_;
+
+    delete $self->{args}{debug};
+
+    my @args;
+    while (my ($flag, $value) = each %{$self->{args}}) {
+      push @args, "--$flag";
+      push @args, $value if defined $value;
+    }
+
+    exec("$^X -d $0 @args");
+    die "couldn't restart with debugger support, yo\n";
+  }
+
+  sub history {
+    my ($self) = @_;
+
+    my $h = 1;
+    foreach (@{$self->{history}}) {
+      print(STDOUT "$h    $_\n");
+      $h++;
+    }
+
+    return (1, 0);
+  }
+
+  sub finalize {
+    my ($self) = @_;
+    $self->history;
+    return (1, 0) if wantarray;
+    return;
+  }
+}
