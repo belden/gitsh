@@ -60,12 +60,17 @@ $gitsh->go;
     CORE::exit($self->{'$?'});
   }
 
+  sub _debug {
+    my ($self, @target) = @_;
+    if ($self->{env}{GITSH_DEBUG}) {
+      require Data::Dumper;
+      print(STDERR Data::Dumper::Dumper(\@target));
+    }
+  }
+
   sub examine {
     my ($self) = @_;
-    if ($self->{env}{GITSH_DEBUG}) {
-      use Data::Dumper;
-      print Dumper $self;
-    }
+    $self->_debug($self);
     return (1, 0);
   }
 
@@ -125,8 +130,8 @@ $gitsh->go;
     if ($self->{env}{GITSH_DEBUG} && $parse->{command} =~ m{^_}) {
       return sub {
         my @g = $self->$handler($parse);
-        use Data::Dumper;
-        print Dumper \@g;
+        local $self->{env}{GITSH_DEBUG} = 1;
+        $self->_debug(\@g);
         return (1, 0);
       };
     } else {
@@ -233,6 +238,13 @@ $gitsh->go;
 
   sub _shell {
     my ($self, @args) = @_;
+
+    chomp(my $helper = `which gitsh-$args[0]-helper`);
+    if ($helper) {
+      $args[0] = $helper;
+    }
+
+    $self->_debug(@args);
     return qx{@args};
   }
 
@@ -301,6 +313,11 @@ $gitsh->go;
     return (1, 0);
   }
 
+  sub _cd {
+    my ($self, $dest) = @_;
+    $self->_git('checkout', $dest);
+  }
+
   sub cd {
     my ($self, $command) = @_;
     my $ok = 0;
@@ -309,7 +326,7 @@ $gitsh->go;
     push @{$self->{dirstack}}, {
       branch => $self->_pwd,
     };
-    $self->_git('checkout', $dest);
+    $self->_cd($dest);
     return (1, $ok);
   }
 
@@ -322,6 +339,62 @@ $gitsh->go;
       print(STDOUT $self->_shell('cat', @{$command->{args}}));
     }
     return (1, 0);
+  }
+
+  sub unzip (&@) {
+    my $c = shift;
+    my ($l, $r) = ([], []);
+    foreach (@_) {
+      my $ar = $c->() ? $l : $r;
+      push @$ar, $_;
+    }
+    return ($l, $r);
+  }
+
+  sub diff {
+    my ($self, $command) = @_;
+
+    my ($args, $opts) = unzip { ref($_) eq 'Gitsh::branch' } @{$command->{args}};
+    my @files = map { "$_->{branch}:$_->{file}" } @$args;
+    if (@files == 2) {
+      print(STDOUT $self->_shell('diff', @$opts, @files[0,1]));
+    } elsif (grep { /\.\./ } @$opts) {
+      my ($diff_spec, $diff_opts) = unzip { $_ =~ m{\.\.} } @$opts;
+      print(STDOUT $self->_git('diff', @$diff_opts, @$diff_spec));
+    }
+    return (1, 0);
+  }
+
+  sub mkdir {
+    my ($self, $command) = @_;
+
+    my $cwd = $self->_pwd;
+    my $dest = $command->{args}[0];
+    $dest =~ s{^(?!gitsh-)}{gitsh-};
+    my $output = $self->_git('checkout', '-b', $dest);
+    print $output if $output;
+
+    my $error = 0;
+    if ($cwd eq $self->_pwd) {
+      $error = 1;
+    } else {
+      $self->_cd($cwd);
+    }
+    return (1, $error);
+  }
+
+  sub rmdir {
+    my ($self, $command) = @_;
+
+    my $target = $command->{args}[0];
+    # the typo is a deliberate "check yourself before you wreck yourself"
+    if (! $self->{env}{GITSH_ALLOW_DANGERNUS_ACTIONS}) {
+      print(STDERR "rmdir $target: refusing to run without GITSH_ALLOW_DANGEROUS_ACTIONS set\n");
+      return (1, 0);
+    } else {
+      delete $self->{env}{GITSH_ALLOW_DANGERNUS_ACTIONS};
+      print(STDOUT $self->_git('branch', '-D', $target));
+    }
   }
 
   sub restart_under_debugger {

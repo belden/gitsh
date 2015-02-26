@@ -1,2 +1,2 @@
 all:
-	rsync -zar bin/gitsh ~/bin
+	rsync -zar bin/ ~/bin/
