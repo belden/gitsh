@@ -8,8 +8,14 @@ my %args;
 GetOptions(
   'command=s'     => \$args{command},
   'debug'         => \$args{debug},
-  'with-status=i' => \$args{'with-status'},
+  'git-root=s'    => \(my $git_root),
 );
+
+chdir($git_root) if $git_root;
+
+if ($args{command}) {
+  $args{command} = join ' ', $args{command}, @ARGV;
+}
 
 my $gitsh = Gitsh->new(%args);
 $gitsh->go;
@@ -25,10 +31,14 @@ $gitsh->go;
     my ($class, %args) = @_;
     return bless {
       args    => \%args,
-      '$?'    => $args{'with-status'} || 0,
+      '$?'    => 0,
       command => $args{command},
       debug   => $args{debug} || 0,
       history => [],
+      env => +{
+        GITSH_VERBOSE => 0,
+      },
+      hints => +{},
     }, $class;
   }
 
@@ -40,11 +50,7 @@ $gitsh->go;
     my $keep_running = 1;
     $|++;
     while ($keep_running) {
-
-      # print a prompt and get some input - weird handling of $command so ^D works
-      print STDOUT 'dev@t1-dev:adama¿¡ ';
       my $command = $self->_get_command;
-
       ($keep_running, $self->{'$?'}) = $self->dispatch($command);
     }
 
@@ -54,15 +60,27 @@ $gitsh->go;
 
   sub _get_command {
     my ($self) = @_;
-    my $command = $self->{command} || <>;
-    if (!defined $command) {
-      print STDOUT "\n";
-      $command = 'exit';
+
+    my $command;
+    if ($self->{command}) {        # we were invoked as `gitsh --command blah`
+      $command = delete $self->{command}; # your wish is my command
+      $self->{hints}{history}{args}{skip} = 1;
+      $self->{command} = 'exit';          # prep for exit on next entry here
+    } else {
+      print STDOUT 'dev@t1-dev:adama¿¡ ';
+      $command = <>;
+
+      if (!defined $command) {  # assume user hit ^D (that's how I got here anyway)
+        print STDOUT "\n";      # exit to shell is weird without this newline
+        $command = 'exit';
+      } else {
+        chomp $command;
+      }
     }
-    chomp $command;
 
     $self->add_history($command) unless $command eq 'exit';
-    return $command;
+    my $parse = $self->parse($command);
+    return $parse;
   }
 
   sub add_history {
@@ -76,34 +94,87 @@ $gitsh->go;
     return $handler->();
   }
 
-  sub dispatch_map {
-    my ($self, $command) = @_;
-    my $parse = $self->parse($command);
-    my $handler = $self->can($parse->{command}) || sub {
-      my ($self, $args) = @_;
-      print STDERR "$parse->{command}: command not found\n";
+  sub _error_builder {
+    my ($self, $message_builder) = @_;
+    return sub {
+      my ($self, $command) = @_;
+      print STDERR $message_builder->($self, $command);
       return (1, 1);
     };
+  }
+
+  sub dispatch_map {
+    my ($self, $parse) = @_;
+
+    my $handler = $self->can($parse->{command}) ||
+      $self->_error_builder(sub {
+        my ($self, $command) = @_;
+        return "$command->{command}: command not found\n";
+      });
 
     if ($parse->{command} =~ m{^_}) {
       return sub {
         my @g = $self->$handler($parse);
-        use Data::Dumper; print Dumper \@g;
+        use Data::Dumper;
+        print Dumper \@g;
         return (1, 0);
       };
     } else {
-      return sub { $self->$handler($parse) };
+      return sub {
+        $self->$handler($parse);
+      };
     }
+  }
+
+  sub _expand_alias {
+    my ($self, $action) = @_;
+    return $self->{aliases}{$action} || $action;
   }
 
   sub parse {
     my ($self, $command) = @_;
+
     my ($action, @args) = split /\s+/, $command;
+    $action = $self->_expand_alias($action);
+
+    # split path-looking-things into [branch,file] tuples
+    my $branches = join '|', map { $_->{name} } $self->_ls;
+    foreach (@args) {
+      if ($_ =~ m{^($branches)/(.+)$}) {
+        $_ = Gitsh::branch->new(branch => $1, file => $2);
+      }
+    }
+
     return +{
       command => $action,
       args => \@args,
       orig => $command,
     };
+  }
+
+  sub alias {
+    my ($self, $command) = @_;
+
+    if ($command->{args}[0]) {
+      if (my ($alias_key, $alias_value) = $command->{args}[0] =~ m{^([^=]+)=(.+)$}) {
+        ($alias_value) =~ m{^'?(.*)'?$};
+        $self->{aliases}{$alias_key} = $alias_value;
+      } else {
+        # error handling if we didn't match, perhaps warn what we expect an alias to look like
+      }
+    } else {
+      $self->_pretty_print_hash($self->{aliases}, 'alias ');
+    }
+    return (1, 0);
+  }
+
+  sub unalias {
+    my ($self, $command) = @_;
+
+    if (defined(my $alias_key = $command->{args}[0])) {
+      delete $self->{aliases}{$alias_key};
+    }
+    return (1, 0);
   }
 
   sub echo {
@@ -128,7 +199,7 @@ $gitsh->go;
     if (safe_eq($command->{args}[0], '--debug')) {
       $self->restart_under_debugger;
     } else {
-      exec("$0 --with-status $self->{'$?'}");
+      exec("$0");
     }
     die "restart: $!\n";
   }
@@ -140,15 +211,88 @@ $gitsh->go;
       my ($active, $name) = $_ =~ m{^(?:([* ]) )(.+)$};
       +{
         name => $name,
-        active => $active eq '*' ? 1 : 0,
+        is_active => $active eq '*' ? 1 : 0,
       },
-    } `git branch`;
+    } $self->_git('branch');
+  }
+
+  sub _git {
+    my ($self, @args) = @_;
+    return $self->_shell('git', @args);
+  }
+
+  sub _shell {
+    my ($self, @args) = @_;
+    return qx{@args};
+  }
+
+  sub style {
+    my ($self, $color, $characters) = @_;
+    my %ansi = (
+      green => "\e[02;32m",
+      reset => "\e[0m",
+    );
+    return sprintf '%s%s%s', $ansi{$color}, $characters, $ansi{reset};
+  }
+
+  sub export {
+    my ($self, $command) = @_;
+
+    my %env =
+    map {
+      my ($k, $v) = split /=/, $_;
+      ($k => $v);
+    }
+    map { split(/\s+/, $_) }
+    @{$command->{args}};
+
+    @{$self->{env}}{keys %env} = values %env;
+    return (1, 0);
+  }
+
+  sub env {
+    my ($self, $command) = @_;
+    $self->_pretty_print_hash($self->{env}, '');
+    return (1, 0);
+  }
+
+  sub _pretty_print_hash {
+    my ($self, $hash, $prefix) = @_;
+    foreach my $k (sort { $a cmp $b } keys %$hash) {
+      print(STDOUT "$prefix$k=$hash->{$k}\n");
+    }
+    return (1, 0);
+  }
+
+  sub ls {
+    my ($self, $command) = @_;
+    foreach my $branch ($self->_ls) {
+      my $name = $branch->{is_active}
+        ? $self->style(green => $branch->{name})
+        : $branch->{name};
+      my $active = $branch->{is_active}
+        ? '*'
+        : ' ';
+      print(STDOUT "$active $name\n");
+    }
+    return (1, 0);
   }
 
   sub pwd {
     my ($self, $command) = @_;
-    my ($branch) = grep { $_->{active} } $self->_ls;
+    my ($branch) = grep { $_->{is_active} } $self->_ls;
     print(STDOUT "$branch->{name}\n");
+    return (1, 0);
+  }
+
+  sub cat {
+    my ($self, $command) = @_;
+    my ($file) = grep { ref($_) && $_->isa('Gitsh::branch') } @{$command->{args}};
+    if ($file) {
+      print(STDOUT $self->_git('show', "$file->{branch}:$file->{file}"));
+    } else {
+      print(STDOUT $self->_shell('cat', @{$command->{args}}));
+    }
     return (1, 0);
   }
 
@@ -168,12 +312,14 @@ $gitsh->go;
   }
 
   sub history {
-    my ($self) = @_;
+    my ($self, $command) = @_;
 
-    my $h = 1;
-    foreach (@{$self->{history}}) {
-      print(STDOUT "$h    $_\n");
-      $h++;
+    if (! $self->{hints}{history}{args}{skip}) {
+      my $h = 1;
+      foreach (@{$self->{history}}) {
+        print(STDOUT "$h    $_\n");
+        $h++;
+      }
     }
 
     return (1, 0);
@@ -185,4 +331,20 @@ $gitsh->go;
     return (1, 0) if wantarray;
     return;
   }
+}
+
+{
+  use strict;
+  use warnings;
+  package Gitsh::branch;
+
+  sub new {
+    my ($class, %args) = @_;
+    return bless +{
+      branch => $args{branch},
+      file   => $args{file},
+    }, $class;
+  }
+
+  1;
 }
