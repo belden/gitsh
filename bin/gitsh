@@ -141,6 +141,15 @@ $gitsh->go;
         $self->_debug(\@g);
         return (1, 0);
       };
+    } elsif ($parse->{command} =~ m{^!}) {
+      return sub {
+        my ($command) = $parse->{orig} =~ m{^!(.+)$};
+        my @g = $self->_shell($command);
+        if (@g) {
+          print $_ foreach @g;
+        }
+        return (1, 0);
+      };
     } else {
       return sub {
         $self->$handler($parse);
