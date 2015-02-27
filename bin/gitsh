@@ -68,6 +68,13 @@ $gitsh->go;
     }
   }
 
+  sub __install {
+    my ($self) = @_;
+    print(STDOUT $_) foreach $self->_shell(qq(make -C $ENV{HOME}/code/gitsh install > /dev/null));
+    print(STDOUT "gitsh: restarting\n");
+    $self->restart;
+  }
+
   sub examine {
     my ($self) = @_;
     $self->_debug($self);
@@ -239,7 +246,8 @@ $gitsh->go;
   sub _shell {
     my ($self, @args) = @_;
 
-    chomp(my $helper = `which gitsh-$args[0]-helper`);
+    my ($command) = $args[0] =~ m{^(\S+)};
+    chomp(my $helper = `which gitsh-$command-helper`);
     if ($helper) {
       $args[0] = $helper;
     }
