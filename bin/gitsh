@@ -93,9 +93,17 @@ $gitsh->go;
 
   sub __install {
     my ($self) = @_;
-    $self->print_stdout($_) foreach $self->_shell(qq(make -C $ENV{HOME}/code/gitsh install > /dev/null));
-    $self->print_stdout("gitsh: restarting\n");
-    $self->restart;
+    my $errors = $self->_shell("$ENV{HOME}/code/gitsh/bin/gitsh --command exit 2>&1");
+    my $ret = $?;
+    my $exit = $ret >> 8;
+    if ($exit != 0) {
+      $self->_print_stderr("gitsh: __install encountered $errors\n");
+      $self->_print_stderr("gitsh: refusing to redeploy and restart\n");
+    } else {
+      $self->_shell(qq(make -C $ENV{HOME}/code/gitsh install > /dev/null));
+      $self->_print_stdout("gitsh: restarting\n");
+      $self->restart;
+    }
   }
 
   sub examine {
