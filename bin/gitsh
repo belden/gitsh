@@ -8,16 +8,11 @@ my %args;
 GetOptions(
   'command=s'     => \$args{command},
   'debug'         => \$args{debug},
-  'git-root=s'    => \(my $git_root),
+  'git-root=s'    => \$args{'git-root'},
+  'login!'        => \$args{login},
 );
 
-chdir($git_root) if $git_root;
-
-if ($args{command}) {
-  $args{command} = join ' ', $args{command}, @ARGV;
-}
-
-my $gitsh = Gitsh->new(%args);
+my $gitsh = Gitsh->ready(%args);
 $gitsh->go;
 
 {
@@ -27,13 +22,24 @@ $gitsh->go;
 
   sub safe_eq { no warnings; return shift eq pop }
 
+  sub ready {
+    my ($class, %args) = @_;
+    chdir($args{'git-root'}) if $args{'git-root'};
+
+    if ($args{command}) {
+      $args{command} = join ' ', $args{command}, @ARGV;
+    }
+
+    return Gitsh->new(%args);
+  }
+
   sub new {
     my ($class, %args) = @_;
-    return bless {
-      args    => \%args,
+    my $self = bless {
       '$?'    => 0,
       command => $args{command},
       debug   => $args{debug} || 0,
+      login => (defined($args{login}) ? $args{login} : 1),
       history => [],
       dirstack => [],
       env => +{
@@ -47,12 +53,22 @@ $gitsh->go;
         \*STDOUT,
       ],
     }, $class;
+
+    $self->{args} = +{
+      (debug => $self->{debug}),
+      ($self->{command} ? (command => $self->{command}) : ()),
+      (login => $self->{login} ? 1 : 0),
+      ($args{'git-root'} ? ('git-root' => $args{'git-root'}) : ()),
+    };
+
+    return $self;
   }
 
   sub go {
     my $self = shift;
 
     $self->restart_under_debugger if $self->{debug};
+    $self->_source("$ENV{HOME}/.gitshrc");
 
     my $keep_running = 1;
     $|++;
@@ -283,12 +299,30 @@ $gitsh->go;
     return (0, 0);
   }
 
+  sub _gitsh_restart_args {
+    my ($self) = @_;
+    delete $self->{args}{debug};
+    return %{$self->{args}};
+  }
+
+  sub restart_under_debugger {
+    my ($self) = @_;
+
+    my @args = $self->_gitsh_restart_args;
+
+    exec("$^X -d $0 @args");
+    die "couldn't restart with debugger support, yo\n";
+  }
+
   sub restart {
     my ($self, $command) = @_;
     if (safe_eq($command->{args}[0], '--debug') || $self->_getenv('GITSH_DEBUG') > 1) {
       $self->restart_under_debugger;
     } else {
-      exec("$0");
+      my %args = $self->_gitsh_restart_args;
+      my $ns = ref($self)->ready(%args);
+      $ns->go;
+      CORE::exit(0);
     }
     die "restart: $!\n";
   }
@@ -348,6 +382,37 @@ $gitsh->go;
     }
 
     return (1, 0);
+  }
+
+  sub _source {
+    my ($self, $file) = @_;
+
+    return if ! $self->{login};
+
+    open my $fh, '<', $file;
+    if (! $fh) {
+      $self->_print_stderr("gitsh: source $file: $!\n");
+      return (1, 1);
+    }
+
+    my $err = 0;
+    while (my $line = <$fh>) {
+      chomp $line;
+      my $parsed = $self->parse($line);
+      my ($method) = $parsed->{command};
+      my ($keep_going, $errors) = $self->$method($parsed);
+
+      if (! $keep_going) {
+        $self->_print_stderr("gitsh: error during source $file:$.:$line\n");
+        return (0, 0);
+      }
+
+      $err = 1 if $errors;
+    }
+
+    close $fh;
+
+    return (1, $err);
   }
 
   sub _withenv {
@@ -496,21 +561,6 @@ $gitsh->go;
       delete $self->{env}{GITSH_ALLOW_DANGERNUS_ACTIONS};
       $self->_print_stdout($self->_git('branch', '-D', $target));
     }
-  }
-
-  sub restart_under_debugger {
-    my ($self) = @_;
-
-    delete $self->{args}{debug};
-
-    my @args;
-    while (my ($flag, $value) = each %{$self->{args}}) {
-      push @args, "--$flag";
-      push @args, $value if defined $value;
-    }
-
-    exec("$^X -d $0 @args");
-    die "couldn't restart with debugger support, yo\n";
   }
 
   sub history {
