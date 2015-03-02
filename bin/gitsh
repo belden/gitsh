@@ -320,6 +320,7 @@ $gitsh->go;
       $self->restart_under_debugger;
     } else {
       my %args = $self->_gitsh_restart_args;
+      delete $args{command} if safe_eq($args{command}, '__install');
       my $ns = ref($self)->ready(%args);
       $ns->go;
       CORE::exit(0);
