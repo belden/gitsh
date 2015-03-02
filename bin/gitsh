@@ -65,19 +65,19 @@ $gitsh->go;
     CORE::exit($self->{'$?'});
   }
 
-  sub read_stdin {
+  sub _read_stdin {
     my ($self) = @_;
     my $fh = $self->{fhs}[0];
     return <$fh>;
   }
 
-  sub print_stdout {
+  sub _print_stdout {
     my ($self, @args) = @_;
     my $fh = $self->{fhs}[1];
     print($fh @args);
   }
 
-  sub print_stderr {
+  sub _print_stderr {
     my ($self, @args) = @_;
     my $fh = $self->{fhs}[2];
     print($fh @args);
@@ -87,7 +87,7 @@ $gitsh->go;
     my ($self, @target) = @_;
     if ($self->{env}{GITSH_DEBUG}) {
       require Data::Dumper;
-      $self->print_stderr(Data::Dumper::Dumper(\@target));
+      $self->_print_stderr(Data::Dumper::Dumper(\@target));
     }
   }
 
@@ -99,9 +99,19 @@ $gitsh->go;
   }
 
   sub examine {
-    my ($self) = @_;
+    my ($self, $command) = @_;
     $self->_debug($self);
     return (1, 0);
+  }
+
+  sub _display_prompt {
+    my ($self) = @_;
+    chomp(my $repo_name = $self->_git('rev-parse', '--git-dir'));
+    if ($repo_name eq '.git') {
+      chomp($repo_name = $self->_shell('pwd'));
+    }
+    ($repo_name) = $repo_name =~ m{.*/([^/]+)(?:/\.git)?$};
+    $self->_print_stderr("dev\@t1-dev:${repo_name}¿¡ ");
   }
 
   sub _get_command {
@@ -112,14 +122,15 @@ $gitsh->go;
       $command = delete $self->{command}; # your wish is my command
       $self->{command} = 'exit';          # prep for exit on next entry here
     } else {
-      $self->print_stdout('dev@t1-dev:adama¿¡ ');
-      $command = $self->read_stdin;
+      $self->_display_prompt;
+      $command = $self->_read_stdin;
 
       if (!defined $command) {  # assume user hit ^D (that's how I got here anyway)
-        $self->print_stdout("\n");      # exit to shell is weird without this newline
+        $self->_print_stdout("\n");      # exit to shell is weird without this newline
         $command = 'exit';
       } else {
         chomp $command;
+        $command = 'noop' if ! length $command;
       }
     }
 
@@ -143,7 +154,7 @@ $gitsh->go;
     my ($self, $message_builder) = @_;
     return sub {
       my ($self, $command) = @_;
-      $self->print_stderr($message_builder->($self, $command));
+      $self->_print_stderr($message_builder->($self, $command));
       return (1, 1);
     };
   }
@@ -151,6 +162,8 @@ $gitsh->go;
   sub dispatch_map {
     my ($self, $parse) = @_;
 
+    # if it's not a known command we can dispatch to, then
+    # make a handler that just tells us we couldn't dispatch
     my $handler = $self->can($parse->{command}) ||
       $self->_error_builder(sub {
         my ($self, $command) = @_;
@@ -160,9 +173,10 @@ $gitsh->go;
     if ($self->{env}{GITSH_DEBUG} && $parse->{command} =~ m{^_}) {
       return sub {
         my @g = $self->$handler($parse);
-        local $self->{env}{GITSH_DEBUG} = 1;
-        $self->_debug(\@g);
-        return (1, 0);
+        return $self->_withenv(+{GITSH_DEBUG => 1}, sub {
+          $self->_debug(\@g);
+          return (1, 0);
+        });
       };
     } elsif ($parse->{command} =~ m{^!}) {
       return sub {
@@ -175,21 +189,32 @@ $gitsh->go;
       };
     } else {
       return sub {
-        $self->$handler($parse);
+        return $self->_withenv($parse->{env}, sub { $self->$handler($parse) });
       };
     }
   }
 
   sub _expand_alias {
     my ($self, $action) = @_;
-    return $self->{aliases}{$action} || $action;
+    return $self->{aliases}{$action};
   }
+
+  sub noop { return (1, 0) }
 
   sub parse {
     my ($self, $command) = @_;
 
+    my %env;
+    (my $env_settings, $command) = $command =~ m{^((?:\S+=\S+\s+)*)?(.+)$};
+    if ($env_settings) {
+      %env = map { split /=/, $_ } split(/\s+/, $env_settings);
+    }
+
     my ($action, @args) = split /\s+/, $command;
-    $action = $self->_expand_alias($action);
+    my $expanded = $self->_expand_alias($action);
+    if ($expanded) {
+      ($action, @args) = split /\s+/, $expanded;
+    }
 
     # split path-looking-things into [branch,file] tuples
     my $branches = join '|', map { $_->{name} } $self->_ls;
@@ -203,6 +228,7 @@ $gitsh->go;
       command => $action,
       args => \@args,
       orig => $command,
+      env => \%env,
     };
   }
 
@@ -210,8 +236,9 @@ $gitsh->go;
     my ($self, $command) = @_;
 
     if ($command->{args}[0]) {
-      if (my ($alias_key, $alias_value) = $command->{args}[0] =~ m{^([^=]+)=(.+)$}) {
-        ($alias_value) =~ m{^'?(.*)'?$};
+      if (my ($alias_key, $alias_value) = $command->{orig} =~ m{^alias ([^=]+)=(.+)$}) {
+        $alias_value =~ s{^'}{};
+        $alias_value =~ s{'$}{};
         $self->{aliases}{$alias_key} = $alias_value;
       } else {
         # error handling if we didn't match, perhaps warn what we expect an alias to look like
@@ -235,10 +262,10 @@ $gitsh->go;
     my ($self, $command) = @_;
 
     if ($command->{args}[0] eq '$?' && 1 == @{$command->{args}}) { # echo $?
-      $self->print_stdout($self->{'$?'}, "\n");
+      $self->_print_stdout($self->{'$?'}, "\n");
     } else { # just echo
       (my $to_echo = $command->{orig}) =~ s{^$command->{command} }{};
-      $self->print_stdout($to_echo, "\n");
+      $self->_print_stdout($to_echo, "\n");
     }
 
     return (1, 0);
@@ -250,7 +277,7 @@ $gitsh->go;
 
   sub restart {
     my ($self, $command) = @_;
-    if (safe_eq($command->{args}[0], '--debug')) {
+    if (safe_eq($command->{args}[0], '--debug') || $self->_getenv('GITSH_DEBUG') > 1) {
       $self->restart_under_debugger;
     } else {
       exec("$0");
@@ -301,15 +328,41 @@ $gitsh->go;
     my ($self, $command) = @_;
 
     my %env =
-    map {
-      my ($k, $v) = split /=/, $_;
-      ($k => $v);
-    }
-    map { split(/\s+/, $_) }
-    @{$command->{args}};
+      map {
+        my ($k, $v) = split /=/, $_;
+        ($k => $v);
+      }
+      map { split(/\s+/, $_) }
+      @{$command->{args}};
 
-    @{$self->{env}}{keys %env} = values %env;
+    while (my ($k, $v) = each %env) {
+      $self->_setenv($k, $v);
+    }
+
     return (1, 0);
+  }
+
+  sub _withenv {
+    my ($self, $env, $code) = @_;
+
+    # ugly local env copy
+    local $self->{env} = +{ %{$self->{env}} };
+    while (my ($k, $v) = each %$env) {
+      $self->_setenv($k => $v);
+    }
+    return $code->();
+  }
+
+  sub _getenv {
+    my ($self, $key) = @_;
+    return exists $self->{env}{$key}
+      ? $self->{env}{$key}
+      : undef;
+  }
+
+  sub _setenv {
+    my ($self, $key, $value) = @_;
+    $self->{env}{$key} = $value;
   }
 
   sub env {
@@ -321,7 +374,7 @@ $gitsh->go;
   sub _pretty_print_hash {
     my ($self, $hash, $prefix) = @_;
     foreach my $k (sort { $a cmp $b } keys %$hash) {
-      $self->print_stdout("$prefix$k=$hash->{$k}\n");
+      $self->_print_stdout("$prefix$k=$hash->{$k}\n");
     }
     return (1, 0);
   }
@@ -335,7 +388,7 @@ $gitsh->go;
       my $active = $branch->{is_active}
         ? '*'
         : ' ';
-      $self->print_stdout("$active $name\n");
+      $self->_print_stdout("$active $name\n");
     }
     return (1, 0);
   }
@@ -349,7 +402,7 @@ $gitsh->go;
   sub pwd {
     my ($self, $command) = @_;
     my $cwd = $self->_pwd;
-    $self->print_stdout("$cwd->{name}\n");
+    $self->_print_stdout("$cwd->{name}\n");
     return (1, 0);
   }
 
@@ -374,9 +427,9 @@ $gitsh->go;
     my ($self, $command) = @_;
     my ($file) = grep { ref($_) && $_->isa('Gitsh::branch') } @{$command->{args}};
     if ($file) {
-      $self->print_stdout($self->_git('show', "$file->{branch}:$file->{file}"));
+      $self->_print_stdout($self->_git('show', "$file->{branch}:$file->{file}"));
     } else {
-      $self->print_stdout($self->_shell('cat', @{$command->{args}}));
+      $self->_print_stdout($self->_shell('cat', @{$command->{args}}));
     }
     return (1, 0);
   }
@@ -397,10 +450,10 @@ $gitsh->go;
     my ($args, $opts) = unzip { ref($_) eq 'Gitsh::branch' } @{$command->{args}};
     my @files = map { "$_->{branch}:$_->{file}" } @$args;
     if (@files == 2) {
-      $self->print_stdout($self->_shell('diff', @$opts, @files[0,1]));
+      $self->_print_stdout($self->_shell('diff', @$opts, @files[0,1]));
     } elsif (grep { /\.\./ } @$opts) {
       my ($diff_spec, $diff_opts) = unzip { $_ =~ m{\.\.} } @$opts;
-      $self->print_stdout($self->_git('diff', @$diff_opts, @$diff_spec));
+      $self->_print_stdout($self->_git('diff', @$diff_opts, @$diff_spec));
     }
     return (1, 0);
   }
@@ -429,11 +482,11 @@ $gitsh->go;
     my $target = $command->{args}[0];
     # the typo is a deliberate "check yourself before you wreck yourself"
     if (! $self->{env}{GITSH_ALLOW_DANGERNUS_ACTIONS}) {
-      $self->print_stderr("rmdir $target: refusing to run without GITSH_ALLOW_DANGEROUS_ACTIONS set\n");
+      $self->_print_stderr("rmdir $target: refusing to run without GITSH_ALLOW_DANGEROUS_ACTIONS set\n");
       return (1, 0);
     } else {
       delete $self->{env}{GITSH_ALLOW_DANGERNUS_ACTIONS};
-      $self->print_stdout($self->_git('branch', '-D', $target));
+      $self->_print_stdout($self->_git('branch', '-D', $target));
     }
   }
 
@@ -455,10 +508,10 @@ $gitsh->go;
   sub history {
     my ($self, $command) = @_;
 
-    if ($command || $self->{env}{GITSH_SHOW_HISTORY_ON_EXIT}) {
+    if ($command || $self->_getenv('GITSH_SHOW_HISTORY_ON_EXIT')) {
       my $h = 1;
       foreach (@{$self->{history}}) {
-        $self->print_stdout("$h    $_\n");
+        $self->_print_stdout("$h    $_\n");
         $h++;
       }
     }
