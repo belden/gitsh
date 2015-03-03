@@ -20,6 +20,8 @@ $gitsh->go;
   use warnings;
   package Gitsh;
 
+  use Cwd ();
+
   sub safe_eq { no warnings; return shift eq pop }
 
   sub ready {
@@ -42,6 +44,10 @@ $gitsh->go;
       login => (defined($args{login}) ? $args{login} : 1),
       history => [],
       dirstack => [],
+      aliases => +{
+      },
+      shell_variables => +{
+      },
       env => +{
         GITSH_VERBOSE => 0,
         GITSH_DEBUG   => 0,
@@ -128,14 +134,39 @@ $gitsh->go;
     return (1, 0);
   }
 
+  sub _git_repo_name {
+    my ($self) = @_;
+
+    my $git_dir = $self->_shell('git', 'rev-parse', '--git-dir', '2>', '/dev/null');
+    $git_dir ||= '';
+    chomp($git_dir);
+
+    if ($git_dir eq '.git') {
+      chomp($git_dir = $self->_shell('pwd'));
+    }
+
+    my ($repo_name) = $git_dir =~ m{.*/([^/]+)(?:/\.git)?$};
+    return $repo_name;
+  }
+
   sub _display_prompt {
     my ($self) = @_;
-    chomp(my $repo_name = $self->_git('rev-parse', '--git-dir'));
-    if ($repo_name eq '.git') {
-      chomp($repo_name = $self->_shell('pwd'));
+
+    my $style;
+    my $repo_or_dir = $self->_git_repo_name;
+
+    if ($repo_or_dir) {
+      $style = 'green';
+      $self->{in_git_repo} = 1;
+    } else {
+      chomp($repo_or_dir = $self->_shell('pwd'));
+      $style = 'red';
+      $self->{in_git_repo} = 0;
     }
-    ($repo_name) = $repo_name =~ m{.*/([^/]+)(?:/\.git)?$};
-    $self->_print_stderr("dev\@t1-dev:${repo_name}¿¡ ");
+
+    my $styled_repo = $self->style($style, $repo_or_dir);
+
+    $self->_print_stderr("dev\@t1-dev:${styled_repo}¿¡ ");
   }
 
   sub _get_command {
@@ -228,6 +259,9 @@ $gitsh->go;
   sub parse {
     my ($self, $command) = @_;
 
+    $command = $self->_expand_special_shell_characters($command);
+    $command = $self->_expand_shell_variables($command);
+
     my %env;
     (my $env_settings, $command) = $command =~ m{^((?:\S+=\S+\s+)*)?(.+)$};
     if ($env_settings) {
@@ -241,10 +275,12 @@ $gitsh->go;
     }
 
     # split path-looking-things into [branch,file] tuples
-    my $branches = join '|', map { $_->{name} } $self->_ls;
-    foreach (@args) {
-      if ($_ =~ m{^($branches)/(.+)$}) {
-        $_ = Gitsh::branch->new(branch => $1, file => $2);
+    if (grep { m{/} } @args) {
+      my $branches = join '|', map { $_->{name} } $self->_ls;
+      foreach (@args) {
+        if ($_ =~ m{^($branches)/(.+)$}) {
+          $_ = Gitsh::branch->new(branch => $1, file => $2);
+        }
       }
     }
 
@@ -256,20 +292,25 @@ $gitsh->go;
     };
   }
 
-  sub alias {
-    my ($self, $command) = @_;
+  sub _gitsh_set_or_display_user_configurable_hash {
+    my ($self, $command, $slot, $slot_name) = @_;
 
     if ($command->{args}[0]) {
-      if (my ($alias_key, $alias_value) = $command->{orig} =~ m{^alias ([^=]+)=(.+)$}) {
-        $alias_value =~ s{^'}{};
-        $alias_value =~ s{'$}{};
-        $self->{aliases}{$alias_key} = $alias_value;
+      if (my ($key, $value) = $command->{orig} =~ m{^$slot_name ([^=]+)=(.+)$}) {
+        $value =~ s{^'}{};
+        $value =~ s{'$}{};
+        $self->{$slot}{$key} = $value;
       } else {
         # error handling if we didn't match, perhaps warn what we expect an alias to look like
       }
     } else {
-      $self->_pretty_print_hash($self->{aliases}, 'alias ');
+      $self->_pretty_print_hash($self->{$slot}, "$slot_name ");
     }
+  }
+
+  sub alias {
+    my ($self, $command) = @_;
+    $self->_gitsh_set_or_display_user_configurable_hash($command, 'aliases', 'alias');
     return (1, 0);
   }
 
@@ -278,6 +319,35 @@ $gitsh->go;
 
     if (defined(my $alias_key = $command->{args}[0])) {
       delete $self->{aliases}{$alias_key};
+    }
+    return (1, 0);
+  }
+
+  sub _expand_special_shell_characters {
+    my ($self, $string) = @_;
+    $string =~ s{~/}{$ENV{HOME}/}g;
+    $string =~ s{~(?!\w)}{$ENV{HOME}};
+    return $string;
+  }
+
+  sub _expand_shell_variables {
+    my ($self, $string) = @_;
+    my $expand = join '|', keys %{$self->{shell_variables}};
+    $string =~ s{\$($expand)\b}{$self->{shell_variables}{$1}}ge;
+    return $string;
+  }
+
+  sub set {
+    my ($self, $command) = @_;
+    $self->_gitsh_set_or_display_user_configurable_hash($command, 'shell_variables', 'set');
+    return (1, 0);
+  }
+
+  sub unset {
+    my ($self, $command) = @_;
+
+    if (defined(my $set_key = $command->{args}[0])) {
+      delete $self->{shell_variables}{$set_key};
     }
     return (1, 0);
   }
@@ -342,6 +412,7 @@ $gitsh->go;
 
   sub _git {
     my ($self, @args) = @_;
+    return if exists $self->{in_git_repo} && ! $self->{in_git_repo};
     return $self->_shell('git', @args);
   }
 
@@ -361,6 +432,7 @@ $gitsh->go;
   sub style {
     my ($self, $color, $characters) = @_;
     my %ansi = (
+      red => "\e[02;31m",
       green => "\e[02;32m",
       reset => "\e[0m",
     );
@@ -389,6 +461,7 @@ $gitsh->go;
     my ($self, $file) = @_;
 
     return if ! $self->{login};
+    return if ! -f $file;
 
     open my $fh, '<', $file;
     if (! $fh) {
@@ -470,13 +543,16 @@ $gitsh->go;
   sub _pwd {
     my ($self) = @_;
     my ($branch) = grep { $_->{is_active} } $self->_ls;
+    my $cwd = Cwd::cwd;
+    $branch->{cwd} = $cwd;
     return $branch;
   }
 
   sub pwd {
     my ($self, $command) = @_;
     my $cwd = $self->_pwd;
-    $self->_print_stdout("$cwd->{name}\n");
+    my $name = $cwd->{name} || $cwd->{cwd};
+    $self->_print_stdout("$name\n");
     return (1, 0);
   }
 
@@ -489,11 +565,15 @@ $gitsh->go;
     my ($self, $command) = @_;
     my $ok = 0;
 
-    my $dest = $command->{args}[0];
-    push @{$self->{dirstack}}, {
-      branch => $self->_pwd,
-    };
-    $self->_cd($dest);
+    if ($self->{in_git_dir}) {
+      my $dest = $command->{args}[0];
+      push @{$self->{dirstack}}, {
+        branch => $self->_pwd,
+      };
+      $self->_cd($dest);
+    } else {
+      CORE::chdir($command->{args}[0]);
+    }
     return (1, $ok);
   }
 
